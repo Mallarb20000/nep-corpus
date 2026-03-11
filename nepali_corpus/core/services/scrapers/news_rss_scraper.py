@@ -31,9 +31,11 @@ import requests
 try:
     from ...models import RawRecord
     from ...models.news_schemas import RssArticle
+    from ...utils.content_types import identify_content_type
 except ImportError:  # pragma: no cover
     from nepali_corpus.core.models import RawRecord
     from nepali_corpus.core.models.news_schemas import RssArticle
+    from nepali_corpus.core.utils.content_types import identify_content_type
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -53,6 +55,7 @@ def article_to_raw(article: RssArticle) -> RawRecord:
         language=article.language,
         published_at=article.published_at,
         tags=list(article.categories) if article.categories else [],
+        content_type=identify_content_type(article.url),
         fetched_at=fetched_at,
         raw_meta={
             "author": article.author,

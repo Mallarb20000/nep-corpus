@@ -6,7 +6,7 @@ import threading
 
 import pytest
 
-from nepali_corpus.core.services.pdf.extractor import PdfJob, extract_pdfs, HAS_PYMUPDF
+from nepali_corpus.core.services.scrapers.pdf.extractor import PdfJob, extract_pdfs, HAS_PYMUPDF
 
 
 @pytest.mark.skipif(not HAS_PYMUPDF, reason="PyMuPDF not installed")

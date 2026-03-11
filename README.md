@@ -138,30 +138,84 @@ All scrapers output JSON with consistent fields:
 
 ## Building a Corpus
 
-Scrape everything into JSONL for fine-tuning:
+### Pipeline CLI (Recommended)
+
+The `coordinator` subcommand is the recommended way to run scraping at scale. It provides:
+- **Parallel execution** across sources with configurable worker count
+- **Run tracking** via `pipeline_runs` and `pipeline_jobs` tables in PostgreSQL
+- **Graceful shutdown** — Ctrl+C finishes in-flight jobs and writes a checkpoint
+- **Resume support** — interrupted runs can be resumed from where they left off
+- **Structured output** — each run writes to `data/runs/{run_id}/`
 
 ```bash
-mkdir -p corpus
+# Start a coordinator run (Gov + News sources, 4 workers)
+python scripts/corpus_cli.py coordinator --categories Gov,News --workers 4 --max-pages 3
 
-# Government ministries (17 sources)
-python govt_scraper.py --all --pages 10 --output corpus/govt/
+# With a specific govt registry group
+python scripts/corpus_cli.py coordinator --categories Gov --govt-registry sources/govt_sources_registry.yaml --govt-groups federal_ministries
 
-# District offices (77 districts — run overnight)
-python dao_scraper.py --all --output corpus/dao/
+# Resume an interrupted run
+python scripts/corpus_cli.py coordinator --resume 20260311_140530
 
-# News RSS (33 feeds)
-python news_rss_scraper.py --output corpus/news.jsonl --format jsonl
-
-# Ekantipur (8 pages)
-python ekantipur_scraper.py --output corpus/ekantipur.jsonl --format jsonl
+# Include social media
+python scripts/corpus_cli.py coordinator --categories Gov,News,Social --workers 6
 ```
 
-Daily cron for accumulating articles:
+Each run creates a structured directory:
+```
+data/runs/20260311_140530/
+├── meta.json           # Run configuration
+├── raw.jsonl           # Scraped records
+└── checkpoint.json     # State checkpoint (written on completion or interrupt)
+```
+
+### Step-by-Step Pipeline
+
+For fine-grained control, use individual pipeline stages:
+
 ```bash
-0 6 * * * cd /path/to/nepali-corpus && python news_rss_scraper.py --output /data/corpus/news_$(date +\%Y\%m\%d).jsonl --format jsonl
-0 7 * * * cd /path/to/nepali-corpus && python ekantipur_scraper.py --output /data/corpus/ekantipur_$(date +\%Y\%m\%d).jsonl --format jsonl
-0 8 * * 0 cd /path/to/nepali-corpus && python dao_scraper.py --priority --output /data/corpus/dao/
+# 1. Ingest raw records
+python scripts/corpus_cli.py ingest -o data/raw/raw.jsonl --govt-registry sources/govt_sources_registry.yaml
+
+# 2. Enrich with full text extraction
+python scripts/corpus_cli.py enrich -i data/raw/raw.jsonl -o data/enriched/enriched.jsonl
+
+# 3. Clean and normalize
+python scripts/corpus_cli.py clean -i data/enriched/enriched.jsonl -o data/cleaned/cleaned.jsonl
+
+# 4. Deduplicate
+python scripts/corpus_cli.py dedup -i data/cleaned/cleaned.jsonl -o data/dedup/dedup.jsonl
+
+# 5. Export training documents
+python scripts/corpus_cli.py export -i data/dedup/dedup.jsonl -o data/final/training.jsonl
+
+# Or run the full pipeline in one command
+python scripts/corpus_cli.py all --govt-registry sources/govt_sources_registry.yaml
 ```
+
+### Dashboard (Monitoring Only)
+
+The dashboard provides a read-only web UI for monitoring:
+
+```bash
+./scripts/start_services.sh   # Starts PostgreSQL + dashboard
+```
+
+**API Endpoints:**
+- `GET /api/status` — Current pipeline status
+- `GET /api/runs` — List recent pipeline runs
+- `GET /api/runs/{run_id}` — Run details with job breakdown
+- `GET /api/runs/{run_id}/jobs?job_type=scrape&status=failed` — Filtered job view
+- `GET /api/sources` — Source catalog with crawled/saved counts
+- `WS /ws/stats` — Live statistics stream
+- `WS /ws/logs` — Live log stream
+
+## Resilience Features
+
+- **Retry with backoff:** `ScraperBase.fetch_page()` uses [tenacity](https://github.com/jd/tenacity) to retry transient HTTP errors (429, 5xx) with exponential backoff (2s → 30s, 3 attempts max).
+- **Graceful shutdown:** The coordinator catches SIGTERM/SIGINT, stops dispatching new jobs, waits for in-flight jobs to complete, and writes a checkpoint.
+- **Resume interrupted runs:** `--resume RUN_ID` re-dispatches pending/interrupted jobs from the database.
+- **Per-job tracking:** Every scrape job is tracked in `pipeline_jobs` with status, record counts, error messages, and timing.
 
 ## Notes
 
@@ -174,3 +228,4 @@ Daily cron for accumulating articles:
 ## License
 
 MIT
+

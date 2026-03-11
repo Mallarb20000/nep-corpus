@@ -25,6 +25,8 @@ import asyncpg
 
 
 TABLES_TO_CLEAR = [
+    "pipeline_jobs",
+    "pipeline_runs",
     "training_documents",
     "visited_urls",
     "raw_records",

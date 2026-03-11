@@ -2,8 +2,20 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import json
 import os
+import signal
 import sys
+import time
+import logging
+from datetime import datetime
+
+# Initialize logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -209,6 +221,117 @@ def cmd_all(args: argparse.Namespace) -> None:
     print("Pipeline complete")
 
 
+def cmd_coordinator(args: argparse.Namespace) -> None:
+    """Run the coordinator directly — parallel scrape with run tracking."""
+    from nepali_corpus.core.services.storage.env_storage import EnvStorageService
+    from nepali_corpus.core.services.scrapers.control import ScrapeCoordinator
+
+    run_id = args.resume or datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = f"data/runs/{run_id}"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Write meta.json
+    meta = {
+        "run_id": run_id,
+        "sources": args.sources,
+        "categories": args.categories,
+        "workers": args.workers,
+        "max_pages": args.max_pages,
+        "gzip": args.gzip,
+        "started_at": datetime.now().isoformat(),
+        "resumed": bool(args.resume),
+    }
+    meta_path = os.path.join(output_dir, "meta.json")
+    if not os.path.exists(meta_path):
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+
+    output_path = os.path.join(output_dir, "raw.jsonl")
+    if args.gzip:
+        output_path += ".gz"
+
+    print(f"{'Resuming' if args.resume else 'Starting'} coordinator run: {run_id}")
+    print(f"Output dir: {output_dir}")
+    print(f"Workers: {args.workers}, Max pages: {args.max_pages}")
+    print(f"Categories: {args.categories or ['Gov', 'News']}")
+    print()
+
+    log_file = os.path.join(output_dir, "run.log")
+
+    async def _run():
+        storage = EnvStorageService()
+        await storage.initialize()
+        coordinator = ScrapeCoordinator(storage)
+
+        # Signal handling for graceful shutdown
+        loop = asyncio.get_running_loop()
+
+        def _on_signal():
+            print("\n⚠️  Shutdown signal received — finishing in-flight jobs...")
+            coordinator.request_shutdown()
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, _on_signal)
+
+        try:
+            if args.resume:
+                await coordinator.resume_run(
+                    run_id=args.resume,
+                    workers=args.workers,
+                    max_pages=args.max_pages,
+                    gzip_output=args.gzip,
+                    output_path=output_path,
+                    govt_registry_path=args.govt_registry,
+                    govt_registry_groups=args.govt_groups,
+                    output_dir=output_dir,
+                    log_file=log_file,
+                )
+            else:
+                await coordinator.start(
+                    workers=args.workers,
+                    max_pages=args.max_pages,
+                    categories=args.categories,
+                    gzip_output=args.gzip,
+                    output_path=output_path,
+                    govt_registry_path=args.govt_registry,
+                    govt_registry_groups=args.govt_groups,
+                    run_id=run_id,
+                    output_dir=output_dir,
+                    log_file=log_file,
+                )
+
+            # Wait for the coordinator task to finish
+            while coordinator.is_running():
+                await asyncio.sleep(1)
+
+        except KeyboardInterrupt:
+            print("\n⚠️  KeyboardInterrupt — flushing...")
+            coordinator.request_shutdown()
+            await asyncio.sleep(1)
+        finally:
+            # Write checkpoint
+            coordinator.write_checkpoint(output_dir)
+
+            # Print summary
+            state_dict = coordinator.state.to_dict()
+            print()
+            print("=" * 60)
+            print(f"Run {run_id} {'interrupted' if coordinator._shutdown_event.is_set() else 'completed'}")
+            print(f"  URLs crawled : {state_dict['urls_crawled']}")
+            print(f"  Docs saved   : {state_dict['docs_saved']}")
+            print(f"  Failures     : {state_dict['urls_failed']}")
+            print(f"  Elapsed      : {state_dict['elapsed']}")
+            print(f"  Checkpoint   : {output_dir}/checkpoint.json")
+            print("=" * 60)
+
+            if coordinator._shutdown_event.is_set():
+                print(f"\nTo resume: python scripts/corpus_cli.py coordinator --resume {run_id}")
+
+            await storage.close()
+
+    asyncio.run(_run())
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Nepali corpus pipeline CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -313,6 +436,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_all.add_argument("--final-out", default="data/final/training.jsonl")
     p_all.set_defaults(func=cmd_all)
 
+    # --- New coordinator subcommand ---
+    p_coord = sub.add_parser(
+        "coordinator",
+        help="Run parallel coordinator with run tracking (recommended for production)",
+    )
+    p_coord.add_argument(
+        "--sources",
+        help="Comma-separated source types (rss, ekantipur, govt, dao, social)",
+    )
+    p_coord.add_argument(
+        "--categories",
+        help="Comma-separated categories (Gov, News, Social). Default: Gov,News",
+    )
+    p_coord.add_argument("--workers", type=int, default=4, help="Parallel workers (default: 4)")
+    p_coord.add_argument("--max-pages", type=int, default=3, help="Max pages per source (default: 3)")
+    p_coord.add_argument("--govt-registry", help="Path to sources/govt_sources_registry.yaml")
+    p_coord.add_argument(
+        "--govt-groups",
+        help="Comma-separated groups from registry",
+    )
+    p_coord.add_argument("--gzip", action="store_true", help="Compress output")
+    p_coord.add_argument(
+        "--resume",
+        metavar="RUN_ID",
+        help="Resume an interrupted run by its run_id",
+    )
+    p_coord.set_defaults(func=cmd_coordinator)
+
     return parser
 
 
@@ -327,6 +478,12 @@ def main() -> None:
     govt_groups = getattr(args, "govt_groups", None)
     if govt_groups:
         args.govt_groups = [g.strip() for g in govt_groups.split(",") if g.strip()]
+    # Parse categories for coordinator subcommand
+    categories_arg = getattr(args, "categories", None)
+    if categories_arg and isinstance(categories_arg, str):
+        args.categories = [c.strip() for c in categories_arg.split(",") if c.strip()]
+    elif categories_arg is None and hasattr(args, "categories"):
+        args.categories = None
     if getattr(args, "sources", None) is None and (
         getattr(args, "govt_groups", None) or getattr(args, "govt_registry", None)
     ):

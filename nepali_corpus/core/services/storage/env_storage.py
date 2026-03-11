@@ -1,14 +1,16 @@
 """SQL storage service for Nepali Corpus."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import hashlib
-from typing import Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from pydantic import ConfigDict
 
-from nepali_corpus.core.models import TrainingDocument
+from nepali_corpus.core.models import RawRecord, TrainingDocument
+from nepali_corpus.core.utils.content_types import identify_content_type
 from .db import AsyncDatabase, HAS_ASYNCPG
 from .storage import StorageService, StorageSession
 
@@ -95,6 +97,16 @@ class SQLEnvStorageSession(StorageSession):
     def _url_hash(self, url: str) -> str:
         return hashlib.md5(url.encode("utf-8")).hexdigest()
 
+    def _scrub(self, val: Any) -> Any:
+        """Remove null bytes which PostgreSQL doesn't like in TEXT/JSONB."""
+        if isinstance(val, str):
+            return val.replace("\x00", "")
+        if isinstance(val, dict):
+            return {self._scrub(k): self._scrub(v) for k, v in val.items()}
+        if isinstance(val, list):
+            return [self._scrub(x) for x in val]
+        return val
+
     async def store_training_document(self, doc: TrainingDocument) -> str:
         if self.service._db is None:
             raise RuntimeError("Database unavailable")
@@ -117,7 +129,6 @@ class SQLEnvStorageSession(StorageSession):
                 district = EXCLUDED.district,
                 tags = EXCLUDED.tags
         """
-        import json
         await self.service._db.execute(
             query,
             doc.id,
@@ -135,16 +146,6 @@ class SQLEnvStorageSession(StorageSession):
         )
         return doc.id
 
-    def _scrub(self, val: Any) -> Any:
-        """Remove null bytes which PostgreSQL doesn't like in TEXT/JSONB."""
-        if isinstance(val, str):
-            return val.replace("\x00", "")
-        if isinstance(val, dict):
-            return {self._scrub(k): self._scrub(v) for k, v in val.items()}
-        if isinstance(val, list):
-            return [self._scrub(x) for x in val]
-        return val
-
     async def store_training_documents(self, docs: Iterable[TrainingDocument]) -> int:
         if self.service._db is None:
             raise RuntimeError("Database unavailable")
@@ -152,8 +153,8 @@ class SQLEnvStorageSession(StorageSession):
         query = """
             INSERT INTO training_documents (
                 id, url, source_id, source_name, language, text,
-                published_at, date_bs, category, province, district, tags
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                published_at, date_bs, category, content_type, province, district, tags
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
             ON CONFLICT (id) DO UPDATE SET
                 url = EXCLUDED.url,
                 source_id = EXCLUDED.source_id,
@@ -163,12 +164,12 @@ class SQLEnvStorageSession(StorageSession):
                 published_at = EXCLUDED.published_at,
                 date_bs = EXCLUDED.date_bs,
                 category = EXCLUDED.category,
+                content_type = EXCLUDED.content_type,
                 province = EXCLUDED.province,
                 district = EXCLUDED.district,
                 tags = EXCLUDED.tags
         """
         args_list = []
-        import json
         for doc in docs:
             args_list.append(
                 (
@@ -181,6 +182,7 @@ class SQLEnvStorageSession(StorageSession):
                     doc.published_at,
                     doc.date_bs,
                     doc.category,
+                    doc.content_type or identify_content_type(doc.url),
                     doc.province,
                     doc.district,
                     json.dumps(self._scrub(doc.tags)) if doc.tags is not None else None,
@@ -198,8 +200,8 @@ class SQLEnvStorageSession(StorageSession):
         query = """
             INSERT INTO raw_records (
                 url, source_id, source_name, title, summary, content,
-                language, published_at, date_bs, category, fetched_at, raw_meta
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                language, published_at, date_bs, category, content_type, fetched_at, raw_meta
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
             ON CONFLICT (url) DO UPDATE SET
                 source_id = EXCLUDED.source_id,
                 source_name = EXCLUDED.source_name,
@@ -210,11 +212,11 @@ class SQLEnvStorageSession(StorageSession):
                 published_at = EXCLUDED.published_at,
                 date_bs = EXCLUDED.date_bs,
                 category = EXCLUDED.category,
+                content_type = EXCLUDED.content_type,
                 fetched_at = EXCLUDED.fetched_at,
                 raw_meta = EXCLUDED.raw_meta
         """
         args_list = []
-        import json
         from ...utils.normalize import devanagari_ratio
 
         for rec in records:
@@ -236,6 +238,7 @@ class SQLEnvStorageSession(StorageSession):
                     rec.published_at,
                     rec.date_bs,
                     rec.category,
+                    rec.content_type or identify_content_type(rec.url),
                     rec.fetched_at,
                     json.dumps(self._scrub(rec.raw_meta)) if rec.raw_meta is not None else None,
                 )
@@ -307,6 +310,157 @@ class SQLEnvStorageSession(StorageSession):
             raise RuntimeError("Database unavailable")
         total = await self.service._db.fetch_value("SELECT COUNT(*) FROM visited_urls")
         return int(total or 0)
+
+    # --- Pipeline run tracking ---
+
+    async def create_pipeline_run(
+        self,
+        run_id: str,
+        sources: Optional[List[str]] = None,
+        categories: Optional[List[str]] = None,
+        config: Optional[Dict[str, Any]] = None,
+        output_dir: Optional[str] = None,
+    ) -> int:
+        if self.service._db is None:
+            return 0
+        row = await self.service._db.fetch_one(
+            """
+            INSERT INTO pipeline_runs (run_id, sources_requested, categories, config_json, output_dir, status)
+            VALUES ($1, $2, $3, $4, $5, 'running')
+            RETURNING id
+            """,
+            run_id,
+            sources or [],
+            categories or [],
+            json.dumps(config or {}),
+            output_dir,
+        )
+        return row[0] if row else 0
+
+    async def update_pipeline_run(self, run_id: str, **kwargs: Any) -> None:
+        if self.service._db is None:
+            return
+        allowed = {
+            "status", "completed_jobs", "failed_jobs", "total_jobs",
+            "total_records_scraped", "total_records_saved", "completed_at",
+        }
+        sets, args = [], []
+        idx = 1
+        for key, val in kwargs.items():
+            if key not in allowed:
+                continue
+            idx += 1
+            sets.append(f"{key} = ${idx}")
+            args.append(val)
+        if not sets:
+            return
+        sets.append(f"updated_at = CURRENT_TIMESTAMP")
+        query = f"UPDATE pipeline_runs SET {', '.join(sets)} WHERE run_id = $1"
+        await self.service._db.execute(query, run_id, *args)
+
+    async def create_pipeline_job(
+        self,
+        pipeline_run_id: int,
+        job_type: str,
+        source_id: str,
+        source_name: Optional[str] = None,
+        category: Optional[str] = None,
+        scraper_class: Optional[str] = None,
+    ) -> int:
+        if self.service._db is None:
+            return 0
+        row = await self.service._db.fetch_one(
+            """
+            INSERT INTO pipeline_jobs
+                (pipeline_run_id, job_type, source_id, source_name, category, scraper_class)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id
+            """,
+            pipeline_run_id, job_type, source_id, source_name, category, scraper_class,
+        )
+        return row[0] if row else 0
+
+    async def update_pipeline_job(self, job_id: int, **kwargs: Any) -> None:
+        if self.service._db is None:
+            return
+        allowed = {
+            "status", "error_message", "records_crawled", "records_saved",
+            "records_failed", "pages_scraped", "last_url", "attempt_number",
+            "started_at", "completed_at", "duration_ms",
+        }
+        sets, args = [], []
+        idx = 1
+        for key, val in kwargs.items():
+            if key not in allowed:
+                continue
+            idx += 1
+            sets.append(f"{key} = ${idx}")
+            args.append(val)
+        if not sets:
+            return
+        sets.append(f"updated_at = CURRENT_TIMESTAMP")
+        query = f"UPDATE pipeline_jobs SET {', '.join(sets)} WHERE id = $1"
+        await self.service._db.execute(query, job_id, *args)
+
+    async def get_pending_jobs(self, run_id: str, job_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        if self.service._db is None:
+            return []
+        base = """
+            SELECT pj.* FROM pipeline_jobs pj
+            JOIN pipeline_runs pr ON pr.id = pj.pipeline_run_id
+            WHERE pr.run_id = $1
+              AND pj.status IN ('pending', 'interrupted')
+              AND pj.attempt_number <= pj.max_attempts
+        """
+        if job_type:
+            base += " AND pj.job_type = $2 ORDER BY pj.id"
+            rows = await self.service._db.fetch(base, run_id, job_type)
+        else:
+            base += " ORDER BY pj.id"
+            rows = await self.service._db.fetch(base, run_id)
+        return [dict(r) for r in rows]
+
+    async def get_run_status(self, run_id: str) -> Optional[Dict[str, Any]]:
+        if self.service._db is None:
+            return None
+        row = await self.service._db.fetch_one(
+            "SELECT * FROM pipeline_runs WHERE run_id = $1", run_id
+        )
+        if not row:
+            return None
+        result = dict(row)
+        # Add job breakdown
+        job_rows = await self.service._db.fetch(
+            """
+            SELECT job_type, status, COUNT(*) as cnt,
+                   COALESCE(SUM(records_crawled), 0) as total_crawled,
+                   COALESCE(SUM(records_saved), 0) as total_saved,
+                   COALESCE(SUM(records_failed), 0) as total_failed
+            FROM pipeline_jobs
+            WHERE pipeline_run_id = $1
+            GROUP BY job_type, status
+            """,
+            result["id"],
+        )
+        result["jobs_breakdown"] = [dict(r) for r in job_rows]
+        return result
+
+    async def list_runs(self, limit: int = 20) -> List[Dict[str, Any]]:
+        if self.service._db is None:
+            return []
+        rows = await self.service._db.fetch(
+            """
+            SELECT id, run_id, sources_requested, categories, status,
+                   total_jobs, completed_jobs, failed_jobs,
+                   total_records_scraped, total_records_saved,
+                   output_dir, started_at, completed_at
+            FROM pipeline_runs
+            ORDER BY started_at DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+        return [dict(r) for r in rows]
 
 
 class EnvStorageService(SQLStorageService):

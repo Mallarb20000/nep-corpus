@@ -12,7 +12,6 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from nepali_corpus.core.services.storage.env_storage import EnvStorageService
-from nepali_corpus.core.services.scrapers.control import ScrapeCoordinator
 from .sources import get_sources
 from .file_tables import (
     infer_columns_from_jsonl,
@@ -33,7 +32,6 @@ if os.path.isdir(static_dir):
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 storage = EnvStorageService()
-coordinator = ScrapeCoordinator(storage)
 
 _ws_clients: List[WebSocket] = []
 _log_buffer: List[str] = []
@@ -77,6 +75,80 @@ def _setup_logging() -> None:
         root.setLevel(logging.INFO)
 
 
+async def _tail_run_logs():
+    """Background task to tail logs from most recent run."""
+    last_pos = 0
+    current_log_file = None
+    last_run_id = None
+
+    while True:
+        try:
+            if storage._db is None:
+                await asyncio.sleep(2)
+                continue
+
+            session = storage.create_session()
+            runs = await session.list_runs(limit=1)
+            
+            if not runs:
+                await asyncio.sleep(5)
+                continue
+
+            latest = runs[0]
+            run_id = latest.get("run_id")
+            status = latest.get("status")
+            output_dir = latest.get("output_dir")
+            
+            if not output_dir:
+                await asyncio.sleep(2)
+                continue
+
+            # Ensure output_dir is absolute
+            if not os.path.isabs(output_dir):
+                # app.py is in nepali_corpus/core/services/dashboard/
+                # dashboard -> services -> core -> nepali_corpus -> nepali-corpus (repo root)
+                repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../"))
+                
+                # Double check if data dir exists there, otherwise try CWD
+                if not os.path.exists(os.path.join(repo_root, "data")):
+                    repo_root = os.getcwd()
+                
+                output_dir = os.path.join(repo_root, output_dir)
+            
+            log_path = os.path.join(output_dir, "run.log")
+            
+            # If it's a new run, reset positions
+            if run_id != last_run_id:
+                _logger.info(f"Watching new run logs: {log_path}")
+                last_run_id = run_id
+                current_log_file = log_path
+                last_pos = 0
+                _log_buffer.clear() 
+            
+            if os.path.exists(log_path):
+                with open(log_path, "r", encoding="utf-8") as f:
+                    f.seek(last_pos)
+                    lines = f.readlines()
+                    if lines:
+                        last_pos = f.tell()
+                        for line in lines:
+                            msg = line.strip()
+                            if msg:
+                                _log_buffer.append(msg)
+                                if len(_log_buffer) > 500:
+                                    _log_buffer.pop(0)
+                                await _broadcast_log(msg)
+            
+            # If not running, sleep longer
+            if status != "running":
+                await asyncio.sleep(5)
+            else:
+                await asyncio.sleep(1)
+        except Exception as e:
+            _logger.debug(f"Log tailing error: {e}")
+            await asyncio.sleep(5)
+
+
 @app.get("/")
 async def root() -> FileResponse:
     return FileResponse(os.path.join(static_dir, "index.html"))
@@ -89,6 +161,9 @@ async def on_startup() -> None:
         await storage.initialize()
     except Exception as exc:
         _logger.warning("Storage initialization failed: %s", exc)
+    
+    # Start background log watcher
+    asyncio.create_task(_tail_run_logs())
 
 
 @app.on_event("shutdown")
@@ -158,54 +233,106 @@ async def download_file(file_path: str):
 
 @app.get("/api/status")
 async def get_status() -> dict:
-    data = coordinator.state.to_dict()
-    data["db_url_count"] = None
+    """Read-only status: reads from the latest pipeline_runs row in DB."""
+    data: Dict[str, Any] = {
+        "running": False,
+        "paused": False,
+        "urls_crawled": 0,
+        "urls_failed": 0,
+        "docs_saved": 0,
+        "pdf_saved": 0,
+        "speed": 0.0,
+        "elapsed": "00:00:00",
+        "current_sources": [],
+        "recent_errors": [],
+        "source_stats": {},
+        "db_url_count": None,
+    }
+
     if storage._db is not None:
         try:
             session = storage.create_session()
             data["db_url_count"] = await session.count_urls()
+
+            # Check for currently running pipeline
+            runs = await session.list_runs(limit=1)
+            if runs:
+                latest = runs[0]
+                data["running"] = latest.get("status") == "running"
+                data["urls_crawled"] = latest.get("total_records_scraped", 0)
+                data["docs_saved"] = latest.get("total_records_saved", 0)
         except Exception:
-            data["db_url_count"] = None
+            pass
+
     return data
 
 
-@app.post("/api/start")
-async def start_scraper(payload: Dict[str, Any]) -> dict:
-    if coordinator.is_running():
-        raise HTTPException(status_code=400, detail="Scraper already running")
+# --- Pipeline run history (read-only) ---
 
-    workers = int(payload.get("workers", 4))
-    max_pages = payload.get("max_pages")
-    categories = payload.get("categories") or None
-    pdf_enabled = bool(payload.get("pdf_enabled", False))
-    gzip_output = bool(payload.get("gzip_output", False))
-
-    await coordinator.start(
-        workers=workers,
-        max_pages=max_pages,
-        categories=categories,
-        pdf_enabled=pdf_enabled,
-        gzip_output=gzip_output,
-    )
-    return {"status": "started", "workers": workers}
+@app.get("/api/runs")
+async def list_runs(limit: int = Query(20, ge=1, le=100)) -> Dict[str, Any]:
+    """List recent pipeline runs."""
+    if storage._db is None:
+        return {"runs": [], "total": 0}
+    try:
+        session = storage.create_session()
+        runs = await session.list_runs(limit=limit)
+        return {"runs": runs, "total": len(runs)}
+    except Exception as e:
+        _logger.error(f"Failed to list runs: {e}")
+        return {"runs": [], "total": 0}
 
 
-@app.post("/api/stop")
-async def stop_scraper() -> dict:
-    await coordinator.stop()
-    return {"status": "stopped"}
+@app.get("/api/runs/{run_id}")
+async def get_run(run_id: str) -> Dict[str, Any]:
+    """Get details of a specific pipeline run including jobs breakdown."""
+    if storage._db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    try:
+        session = storage.create_session()
+        status = await session.get_run_status(run_id)
+        if not status:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return status
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/pause")
-async def pause_scraper() -> dict:
-    coordinator.pause()
-    return {"status": "paused"}
+@app.get("/api/runs/{run_id}/jobs")
+async def get_run_jobs(
+    run_id: str,
+    job_type: Optional[str] = Query(None, description="Filter by job type: scrape, enrich, export"),
+    status: Optional[str] = Query(None, description="Filter by status: pending, running, completed, failed, interrupted"),
+) -> Dict[str, Any]:
+    """Get pipeline jobs for a specific run, with optional type/status filters."""
+    if storage._db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    try:
+        # Build query dynamically
+        base = """
+            SELECT pj.* FROM pipeline_jobs pj
+            JOIN pipeline_runs pr ON pr.id = pj.pipeline_run_id
+            WHERE pr.run_id = $1
+        """
+        args = [run_id]
+        idx = 1
+        if job_type:
+            idx += 1
+            base += f" AND pj.job_type = ${idx}"
+            args.append(job_type)
+        if status:
+            idx += 1
+            base += f" AND pj.status = ${idx}"
+            args.append(status)
+        base += " ORDER BY pj.id"
 
-
-@app.post("/api/resume")
-async def resume_scraper() -> dict:
-    coordinator.resume()
-    return {"status": "resumed"}
+        rows = await storage._db.fetch(base, *args)
+        jobs = [dict(r) for r in rows]
+        return {"jobs": jobs, "total": len(jobs)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/logs")
@@ -233,7 +360,7 @@ async def ws_stats(websocket: WebSocket):
     try:
         while True:
             data = await get_status()
-            await websocket.send_text(json.dumps(data))
+            await websocket.send_text(json.dumps(data, default=str))
             await asyncio.sleep(1)
     except (WebSocketDisconnect, Exception):
         return
@@ -244,7 +371,6 @@ async def list_sources(refresh: bool = Query(False)) -> Dict[str, Any]:
     sources = get_sources(refresh=refresh)
     crawled_counts: Dict[str, int] = {}
     saved_counts: Dict[str, int] = {}
-    live_stats = coordinator.state.source_stats
 
     if storage._db is not None:
         try:
@@ -264,15 +390,12 @@ async def list_sources(refresh: bool = Query(False)) -> Dict[str, Any]:
 
     for source in sources:
         sid = source["id"]
-        # Use live stats if available, else DB counts
-        live = live_stats.get(sid, {})
-        
         saved_db = saved_counts.get(sid, 0)
         crawled_db = crawled_counts.get(sid, 0)
         
-        source["saved"] = live.get("saved", saved_db)
-        source["crawled"] = live.get("crawled", max(crawled_db, source["saved"]))
-        source["failed"] = live.get("failed", 0)
+        source["saved"] = saved_db
+        source["crawled"] = max(crawled_db, saved_db)
+        source["failed"] = 0
 
     return {
         "sources": sources,
@@ -460,10 +583,3 @@ async def search_database(
         "page_size": page_size,
         "total_pages": (int(total_count or 0) + page_size - 1) // page_size if total_count else 1,
     }
-
-
-@app.get("/")
-async def read_root():
-    if os.path.isdir(static_dir):
-        return FileResponse(os.path.join(static_dir, "index.html"))
-    return {"message": "Dashboard UI not found"}

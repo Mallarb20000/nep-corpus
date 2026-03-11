@@ -33,10 +33,12 @@ try:
     from ...models import RawRecord
     from ...models.government_schemas import GovtPost, MinistryConfig, RegistryEntry
     from .scraper_base import ScraperBase
+    from ...utils.content_types import identify_content_type
 except ImportError:  # pragma: no cover
     from nepali_corpus.core.models import RawRecord
     from nepali_corpus.core.models.government_schemas import GovtPost, MinistryConfig, RegistryEntry
     from nepali_corpus.core.services.scrapers.scraper_base import ScraperBase
+    from nepali_corpus.core.utils.content_types import identify_content_type
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -57,6 +59,7 @@ def post_to_raw(post: GovtPost) -> RawRecord:
         published_at=post.date_ad.isoformat() if post.date_ad else None,
         date_bs=post.date_bs,
         category=post.category,
+        content_type=identify_content_type(post.url),
         fetched_at=scraped_at,
         raw_meta={
             "has_attachment": post.has_attachment,

@@ -12,9 +12,11 @@ from bs4 import BeautifulSoup
 try:
     from ...models import RawRecord
     from .scraper_base import ScraperBase
+    from ...utils.content_types import identify_content_type
 except ImportError:
     from nepali_corpus.core.models import RawRecord
     from nepali_corpus.core.services.scrapers.scraper_base import ScraperBase
+    from nepali_corpus.core.utils.content_types import identify_content_type
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +98,7 @@ class NitterScraper(ScraperBase):
                     language="ne" if any('\u0900' <= c <= '\u097f' for c in text) else "en",
                     published_at=date_str,
                     category="Social",
+                    content_type=identify_content_type(tweet_url),
                     raw_meta={"username": username, "type": "user_tweet"}
                 ))
             
@@ -142,6 +145,7 @@ class NitterScraper(ScraperBase):
                     content=text,
                     language="ne" if any('\u0900' <= c <= '\u097f' for c in text) else "en",
                     category="Social",
+                    content_type=identify_content_type(tweet_url),
                     raw_meta={"query": query, "username": username, "type": "search_tweet"}
                 ))
             
