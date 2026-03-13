@@ -48,19 +48,19 @@ class DiscoveryMiner(ScraperBase):
         self._parse_robots_txt()
 
         # 1. Sitemap discovery (fastest, most accurate)
-        sitemaps = self.discover_from_sitemaps()
+        sitemaps = {u for u in self.discover_from_sitemaps() if self._is_potential_article(u)}
         yield from _batch_and_yield(sitemaps)
 
         # 2. Feed discovery
-        feeds = self.discover_from_feeds()
+        feeds = {u for u in self.discover_from_feeds() if self._is_potential_article(u)}
         yield from _batch_and_yield(feeds)
 
         # 3. Navigation / section discovery from homepage
-        nav_urls = self.discover_from_navigation()
+        nav_urls = {u for u in self.discover_from_navigation() if self._is_potential_article(u)}
         yield from _batch_and_yield(nav_urls)
 
         # 4. Pattern-based discovery
-        patterns = self.discover_common_patterns()
+        patterns = {u for u in self.discover_common_patterns() if self._is_potential_article(u)}
         yield from _batch_and_yield(patterns)
 
         # 5. Pagination on listing pages discovered so far

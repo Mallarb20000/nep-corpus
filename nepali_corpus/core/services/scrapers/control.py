@@ -119,6 +119,8 @@ class ScrapeCoordinator:
         max_concurrent: int = 20,
         source_timeout: int = 300,
         checkpoint_interval: int = 300,
+        ocr_enabled: bool = True,
+        pdf_enabled: bool = True,
     ) -> None:
         self._storage = storage
         self.state = ScrapeState()
@@ -137,6 +139,8 @@ class ScrapeCoordinator:
         self._enrichment_batch_size = enrichment_batch_size
         self._enrichment_buffer: List[RawRecord] = []
         self._enrichment_lock = asyncio.Lock()
+        self._ocr_enabled = ocr_enabled
+        self._pdf_enabled = pdf_enabled
         self._source_timeout = source_timeout
         self._checkpoint_interval = checkpoint_interval
         self._visited_urls: Set[str] = set()  # In-memory fast dedup
@@ -205,6 +209,7 @@ class ScrapeCoordinator:
         max_pages: Optional[int] = None,
         categories: Optional[List[str]] = None,
         pdf_enabled: bool = False,
+        ocr_enabled: bool = False,
         gzip_output: bool = False,
         output_path: str = "data/raw/raw.jsonl",
         pdf_output_dir: str = "data/pdfs",
@@ -232,6 +237,7 @@ class ScrapeCoordinator:
                 max_pages=max_pages,
                 categories=categories,
                 pdf_enabled=pdf_enabled,
+                ocr_enabled=ocr_enabled,
                 gzip_output=gzip_output,
                 output_path=output_path,
                 pdf_output_dir=pdf_output_dir,
@@ -500,6 +506,7 @@ class ScrapeCoordinator:
         max_pages: Optional[int],
         categories: Optional[List[str]],
         pdf_enabled: bool,
+        ocr_enabled: bool = True,
         gzip_output: bool,
         output_path: str,
         pdf_output_dir: str,
@@ -509,6 +516,8 @@ class ScrapeCoordinator:
         log_file: Optional[str] = None,
         num_sources: Optional[int] = None,
     ) -> None:
+        self._ocr_enabled = ocr_enabled
+        self._pdf_enabled = pdf_enabled
         if log_file:
             self._setup_file_logging(log_file)
 
@@ -929,27 +938,36 @@ class ScrapeCoordinator:
         try:
             # 1. Fetch content
             from nepali_corpus.pipeline.runner import enrich_records
-            enriched = enrich_records(records, cache_dir="data/html_cache")
+            enriched = enrich_records(
+                records, 
+                cache_dir="data/html_cache",
+                ocr_enabled=self._ocr_enabled,
+                pdf_enabled=self._pdf_enabled
+            )
             
             final_docs = []
             for rec, content in enriched:
                 if content:
                     rec.content = content
-                    # Identify if it's quality training data
-                    if len(content.strip()) >= 100:
-                        doc_id = hashlib.md5(rec.url.encode()).hexdigest()
-                        doc = TrainingDocument(
-                            id=doc_id,
-                            url=rec.url,
-                            source_id=rec.source_id,
-                            source_name=rec.source_name,
-                            language=rec.language or "ne",
-                            text=content.strip(),
-                            category=rec.category,
-                            published_at=rec.published_at,
-                            date_bs=rec.raw_meta.get("date_bs") if rec.raw_meta else None,
-                        )
-                        final_docs.append(doc)
+                    # Use domain profiles if available
+                    cleaned = self._boilerplate_detector.clean_document(content, rec.source_id)
+                    
+                    if len(cleaned.strip()) >= 100:
+                        from ...utils.normalize import devanagari_ratio
+                        if devanagari_ratio(cleaned) >= 0.3:
+                            doc_id = hashlib.md5(rec.url.encode()).hexdigest()
+                            doc = TrainingDocument(
+                                id=doc_id,
+                                url=rec.url,
+                                source_id=rec.source_id,
+                                source_name=rec.source_name,
+                                language=rec.language or "ne",
+                                text=cleaned.strip(),
+                                category=rec.category,
+                                published_at=rec.published_at,
+                                date_bs=rec.raw_meta.get("date_bs") if rec.raw_meta else None,
+                            )
+                            final_docs.append(doc)
             
             if final_docs:
                 await session.store_training_documents(final_docs)

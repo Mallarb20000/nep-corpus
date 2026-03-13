@@ -144,7 +144,14 @@ def _detect_encoding(data: bytes) -> str:
     return "utf-8"
 
 
-def extract_text(data: bytes, content_type: str, url: Optional[str] = None, use_trafilatura: bool = True) -> str:
+def extract_text(
+    data: bytes,
+    content_type: str,
+    url: Optional[str] = None,
+    use_trafilatura: bool = True,
+    ocr_enabled: bool = True,
+    pdf_enabled: bool = True,
+) -> str:
     if not data:
         return ""
 
@@ -308,8 +315,12 @@ def extract_text(data: bytes, content_type: str, url: Optional[str] = None, use_
     cleaned_so_far = clean_extracted_text(extracted_text)
     
     # Strategy 5: Image OCR (for scanned press releases)
-    if (not cleaned_so_far or len(cleaned_so_far.strip()) < 600) and url:
-        logger.info(f"Attempting image OCR for {url} (cleaned len: {len(cleaned_so_far.strip())})")
+    # Only try OCR if text is very short OR has almost no Devanagari
+    if ocr_enabled and url and (
+        not cleaned_so_far or 
+        (len(cleaned_so_far.strip()) < 600 and devanagari_ratio(cleaned_so_far) < 0.2)
+    ):
+        logger.info(f"Attempting image OCR for {url} (len: {len(cleaned_so_far.strip())}, dv: {devanagari_ratio(cleaned_so_far):.2f})")
         ocr_text = _try_ocr_images(html, url)
         if ocr_text and len(ocr_text.strip()) > len(cleaned_so_far.strip()):
             logger.info(f"OCR successful: {len(ocr_text)} chars extracted")
@@ -317,7 +328,10 @@ def extract_text(data: bytes, content_type: str, url: Optional[str] = None, use_
             cleaned_so_far = clean_extracted_text(extracted_text)
 
     # Strategy 6: Embedded PDF extraction
-    if (not cleaned_so_far or len(cleaned_so_far.strip()) < 600) and url:
+    if pdf_enabled and url and (
+        not cleaned_so_far or 
+        (len(cleaned_so_far.strip()) < 600 and devanagari_ratio(cleaned_so_far) < 0.2)
+    ):
         logger.info(f"Attempting embedded PDF extraction for {url}")
         pdf_text = _try_embedded_pdfs(html, url)
         if pdf_text and len(pdf_text.strip()) > len(cleaned_so_far.strip()):
