@@ -377,6 +377,85 @@ def cmd_rerun_failed(args: argparse.Namespace) -> None:
     asyncio.run(_run())
 
 
+def cmd_seed_hf_urls(args: argparse.Namespace) -> None:
+    """Seed visited_urls from an HF dataset URL column."""
+    import hashlib
+    import json as _json
+    from datasets import load_dataset
+    from nepali_corpus.core.services.storage.env_storage import EnvStorageService
+
+    async def _run():
+        storage = EnvStorageService()
+        await storage.initialize()
+
+        cache_path = args.cache_path
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+
+        def _url_hash(url: str) -> str:
+            return hashlib.md5(url.encode("utf-8")).hexdigest()
+
+        async def _seed_from_iter(url_iter, write_cache: bool) -> int:
+            total = 0
+            buffer = []
+            cache_f = open(cache_path, "w", encoding="utf-8") if write_cache else None
+            try:
+                for url in url_iter:
+                    if not url:
+                        continue
+                    url = str(url).strip()
+                    if not url:
+                        continue
+                    buffer.append((_url_hash(url), url))
+                    if write_cache:
+                        cache_f.write(_json.dumps({"url": url}, ensure_ascii=False) + "\n")
+                    if len(buffer) >= args.batch_size:
+                        await storage._db.executemany(
+                            "INSERT INTO visited_urls (url_hash, url) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                            buffer,
+                        )
+                        total += len(buffer)
+                        buffer = []
+                if buffer:
+                    await storage._db.executemany(
+                        "INSERT INTO visited_urls (url_hash, url) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                        buffer,
+                    )
+                    total += len(buffer)
+            finally:
+                if cache_f:
+                    cache_f.close()
+            return total
+
+        if args.refresh_cache:
+            dataset = load_dataset(
+                args.repo_id,
+                name=args.config_name,
+                split=args.split,
+                streaming=True,
+            )
+            total = await _seed_from_iter((row.get("url") for row in dataset), write_cache=True)
+        else:
+            if not os.path.exists(cache_path):
+                raise FileNotFoundError(f"Cache not found: {cache_path}")
+            with open(cache_path, "r", encoding="utf-8") as f:
+                urls = []
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = _json.loads(line)
+                        urls.append(obj.get("url"))
+                    except Exception:
+                        urls.append(line)
+            total = await _seed_from_iter(urls, write_cache=False)
+
+        print(f"Seeded {total} URLs into visited_urls")
+        await storage.close()
+
+    asyncio.run(_run())
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Nepali corpus pipeline CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -567,6 +646,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_rerun.add_argument("--pdf", action="store_true", default=False,
                           help="Enable embedded PDF extraction (default: False)")
     p_rerun.set_defaults(func=cmd_rerun_failed)
+
+    # --- Seed HF URLs into visited_urls ---
+    p_seed = sub.add_parser(
+        "seed-hf-urls",
+        help="Seed visited_urls from a Hugging Face dataset URL column",
+    )
+    p_seed.add_argument("--repo-id", required=True,
+                        help="HF dataset repo id (e.g. org/dataset)")
+    p_seed.add_argument("--split", default="train",
+                        help="HF split to read (default: train)")
+    p_seed.add_argument("--config-name", default="default",
+                        help="HF config name (default: default)")
+    p_seed.add_argument("--batch-size", type=int, default=5000,
+                        help="Insert batch size (default: 5000)")
+    p_seed.add_argument("--cache-path", default="data/hf_url_cache.jsonl",
+                        help="URL cache path (default: data/hf_url_cache.jsonl)")
+    p_seed.add_argument("--refresh-cache", action="store_true",
+                        help="Refresh cache from HF (default: true)")
+    p_seed.add_argument("--no-refresh-cache", action="store_false",
+                        dest="refresh_cache",
+                        help="Use local cache only")
+    p_seed.set_defaults(refresh_cache=True)
+    p_seed.set_defaults(func=cmd_seed_hf_urls)
 
     return parser
 
