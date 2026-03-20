@@ -60,6 +60,26 @@ def iter_inventory(path: str) -> Iterator[Dict[str, Any]]:
                 continue
 
 
+def load_checkpoint(path: Optional[str]) -> set[str]:
+    if not path or not os.path.exists(path):
+        return set()
+    done: set[str] = set()
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                done.add(line)
+    return done
+
+
+def append_checkpoint(path: Optional[str], key: str) -> None:
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(key + "\n")
+
+
 def iter_hf_dataset(repo: str, split: str, config: Optional[str]) -> Iterator[Dict[str, Any]]:
     if config:
         ds = load_dataset(repo, name=config, split=split, streaming=True)
@@ -225,6 +245,7 @@ def main() -> None:
     parser.add_argument("--dataset", action="append", help="Only include specific repo_id")
     parser.add_argument("--system-message", help="System message to prepend if missing")
     parser.add_argument("--token", help="HF token (defaults to cache or HF_TOKEN)")
+    parser.add_argument("--checkpoint", default="data/sft_merge_done.txt", help="Checkpoint file to skip completed repos")
     args = parser.parse_args()
 
     token = args.token or get_token()
@@ -246,6 +267,8 @@ def main() -> None:
     uploaded = 0
     total = 0
 
+    done = load_checkpoint(args.checkpoint)
+
     for row in iter_inventory(args.inventory):
         repo_id = row.get("repo_id")
         split = row.get("split", "train")
@@ -253,6 +276,10 @@ def main() -> None:
         if not repo_id:
             continue
         if wanted and repo_id not in wanted:
+            continue
+        key = f"{repo_id}|{config or 'default'}|{split}"
+        if key in done:
+            logger.info("Skipping already completed repo: %s", repo_id)
             continue
 
         logger.info("Processing source: %s", repo_id)
@@ -311,6 +338,9 @@ def main() -> None:
         except Exception as exc:
             logger.warning("Failed processing %s: %s", repo_id, exc)
             continue
+
+        append_checkpoint(args.checkpoint, key)
+        done.add(key)
 
     if out_rows and (not args.max_batches or uploaded < args.max_batches):
         upload_parquet_batch(

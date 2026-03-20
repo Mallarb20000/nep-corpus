@@ -207,6 +207,36 @@ def iter_jsonl(path: str) -> Iterator[Dict[str, Any]]:
                 continue
 
 
+def load_checkpoint(path: Optional[str]) -> set[str]:
+    if not path or not os.path.exists(path):
+        return set()
+    done: set[str] = set()
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                done.add(line)
+    return done
+
+
+def append_checkpoint(path: Optional[str], key: str) -> None:
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(key + "\n")
+
+
+def checkpoint_key(source: "SourceConfig") -> str:
+    if source.kind == "hf":
+        return f"hf|{source.repo}|{source.config or 'default'}|{source.split}"
+    if source.kind == "jsonl":
+        return f"jsonl|{source.path}"
+    if source.kind == "parquet":
+        return f"parquet|{source.path}"
+    return f"{source.kind}|{source.name}"
+
+
 def iter_parquet(path: str) -> Iterator[Dict[str, Any]]:
     dataset = load_dataset("parquet", data_files=path, split="train", streaming=True)
     for row in dataset:
@@ -485,6 +515,7 @@ def merge_and_upload(
     legacy_filter_spec: Optional[FilterSpec],
     default_language: Optional[str],
     cleanup_cache: bool,
+    checkpoint_path: Optional[str],
 ) -> None:
     api = HfApi()
 
@@ -521,57 +552,67 @@ def merge_and_upload(
         pending: List[Tuple[bytes, Dict[str, Any]]] = []
         uploaded_batches = 0
 
+        done = load_checkpoint(checkpoint_path)
+
         for source in sources:
+            key = checkpoint_key(source)
+            if key in done:
+                logger.info("Skipping already completed source: %s", source.name)
+                continue
             logger.info("Processing source: %s", source.name)
             filter_spec = resolve_filter_spec(
                 source=source,
                 global_spec=global_filter_spec,
                 legacy_spec=legacy_filter_spec,
             )
-            for item in iter_source_items(source):
-                mapped = map_item_to_schema(
-                    item,
-                    source.name,
-                    source.fields or {},
-                    filter_spec,
-                    default_language,
-                )
-                if not mapped:
-                    continue
-                row, text_norm = mapped
-                text_hash = hash_text(text_norm)
-                if not row.get("doc_id"):
-                    row["doc_id"] = text_hash.hex()
-                pending.append((text_hash, row))
+            try:
+                for item in iter_source_items(source):
+                    mapped = map_item_to_schema(
+                        item,
+                        source.name,
+                        source.fields or {},
+                        filter_spec,
+                        default_language,
+                    )
+                    if not mapped:
+                        continue
+                    row, text_norm = mapped
+                    text_hash = hash_text(text_norm)
+                    if not row.get("doc_id"):
+                        row["doc_id"] = text_hash.hex()
+                    pending.append((text_hash, row))
 
-                if len(pending) >= 1000:
-                    new_pairs = store.filter_new(pending)
-                    pending = []
-                    for h, new_row in new_pairs:
-                        if h in out_hash_set:
-                            continue
-                        out_rows.append(new_row)
-                        out_hashes.append(h)
-                        out_hash_set.add(h)
+                    if len(pending) >= 1000:
+                        new_pairs = store.filter_new(pending)
+                        pending = []
+                        for h, new_row in new_pairs:
+                            if h in out_hash_set:
+                                continue
+                            out_rows.append(new_row)
+                            out_hashes.append(h)
+                            out_hash_set.add(h)
 
-                        if len(out_rows) >= batch_size:
-                            upload_parquet_batch(
-                                api=api,
-                                repo_id=repo_id,
-                                token=token,
-                                rows=out_rows[:batch_size],
-                                shard_index=shard_index,
-                            )
-                            store.insert_hashes(out_hashes[:batch_size])
-                            shard_index += 1
-                            uploaded_batches += 1
-                            out_rows = out_rows[batch_size:]
-                            out_hashes = out_hashes[batch_size:]
-                            out_hash_set = set(out_hashes)
+                            if len(out_rows) >= batch_size:
+                                upload_parquet_batch(
+                                    api=api,
+                                    repo_id=repo_id,
+                                    token=token,
+                                    rows=out_rows[:batch_size],
+                                    shard_index=shard_index,
+                                )
+                                store.insert_hashes(out_hashes[:batch_size])
+                                shard_index += 1
+                                uploaded_batches += 1
+                                out_rows = out_rows[batch_size:]
+                                out_hashes = out_hashes[batch_size:]
+                                out_hash_set = set(out_hashes)
 
-                            if max_batches and uploaded_batches >= max_batches:
-                                logger.info("Reached max_batches=%s. Stopping early.", max_batches)
-                                return
+                                if max_batches and uploaded_batches >= max_batches:
+                                    logger.info("Reached max_batches=%s. Stopping early.", max_batches)
+                                    return
+            except Exception as exc:
+                logger.warning("Failed source %s: %s", source.name, exc)
+                continue
 
             if pending:
                 new_pairs = store.filter_new(pending)
@@ -604,6 +645,9 @@ def merge_and_upload(
 
             if cleanup_cache and source.kind == "hf" and source.repo:
                 cleanup_hf_cache(source.repo)
+
+            append_checkpoint(checkpoint_path, key)
+            done.add(key)
 
         if pending:
             new_pairs = store.filter_new(pending)
@@ -657,6 +701,7 @@ def main() -> None:
     parser.add_argument("--exclude-regex", help="Regex to exclude repos from inventory")
     parser.add_argument("--cleanup-cache", action="store_true", default=None, help="Delete HF cache per source")
     parser.add_argument("--no-cleanup-cache", action="store_false", dest="cleanup_cache", default=None)
+    parser.add_argument("--checkpoint", default="data/hf_merge_done.txt", help="Checkpoint file to skip completed sources")
 
     args = parser.parse_args()
 
@@ -739,6 +784,7 @@ def main() -> None:
         legacy_filter_spec=legacy_filter_spec,
         default_language=default_language,
         cleanup_cache=cleanup_cache,
+        checkpoint_path=args.checkpoint,
     )
 
 

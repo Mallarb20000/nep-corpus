@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import sys
 import json
 import logging
 import os
@@ -84,6 +85,26 @@ def iter_inventory(path: str) -> Iterator[Dict[str, Any]]:
                 yield json.loads(line)
             except Exception:
                 continue
+
+
+def load_checkpoint(path: Optional[str]) -> set[str]:
+    if not path or not os.path.exists(path):
+        return set()
+    done: set[str] = set()
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                done.add(line)
+    return done
+
+
+def append_checkpoint(path: Optional[str], repo_id: str) -> None:
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(repo_id + "\n")
 
 
 def select_text_column(columns: List[str]) -> Optional[str]:
@@ -167,25 +188,33 @@ def _markdown_table(headers: List[str], values: List[str]) -> str:
 
 
 def iter_text_from_csv(path: str) -> Iterator[str]:
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        try:
-            sample = f.read(4096)
-            f.seek(0)
-            dialect = csv.Sniffer().sniff(sample)
-        except Exception:
-            dialect = csv.excel
-        reader = csv.DictReader(f, dialect=dialect)
-        if not reader.fieldnames:
-            return
-        text_col = select_text_column(reader.fieldnames)
-        for row in reader:
-            if text_col:
-                val = row.get(text_col)
-                if isinstance(val, str) and val.strip():
-                    yield val
-            else:
-                values = [str(row.get(h, "") or "") for h in reader.fieldnames]
-                yield _markdown_table(reader.fieldnames, values)
+    try:
+        csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
+    except Exception:
+        pass
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            try:
+                sample = f.read(4096)
+                f.seek(0)
+                dialect = csv.Sniffer().sniff(sample)
+            except Exception:
+                dialect = csv.excel
+            reader = csv.DictReader(f, dialect=dialect)
+            if not reader.fieldnames:
+                return
+            text_col = select_text_column(reader.fieldnames)
+            for row in reader:
+                if text_col:
+                    val = row.get(text_col)
+                    if isinstance(val, str) and val.strip():
+                        yield val
+                else:
+                    values = [str(row.get(h, "") or "") for h in reader.fieldnames]
+                    yield _markdown_table(reader.fieldnames, values)
+    except csv.Error as exc:
+        logger.warning("CSV parse failed for %s: %s", path, exc)
+        return
 
 
 def iter_text_from_parquet(path: str) -> Iterator[str]:
@@ -281,6 +310,7 @@ def main() -> None:
     parser.add_argument("--include-review", action="store_true", help="Include review datasets too")
     parser.add_argument("--filter-json", help="Path to JSON filter spec override")
     parser.add_argument("--no-tabular-markdown", action="store_true", help="Skip tabular->markdown conversion")
+    parser.add_argument("--checkpoint", default="data/kaggle_merge_done.txt", help="Checkpoint file to skip completed repos")
     args = parser.parse_args()
 
     api = KaggleApi()
@@ -312,6 +342,8 @@ def main() -> None:
         uploaded = 0
         total_rows = 0
 
+        done = load_checkpoint(args.checkpoint)
+
         for idx, row in enumerate(iter_inventory(args.inventory), start=1):
             if args.max_datasets and idx > args.max_datasets:
                 break
@@ -324,6 +356,9 @@ def main() -> None:
 
             repo_id = row.get("repo_id")
             if not repo_id:
+                continue
+            if repo_id in done:
+                logger.info("Skipping already completed repo: %s", repo_id)
                 continue
             logger.info("Processing Kaggle dataset: %s", repo_id)
 
@@ -342,55 +377,62 @@ def main() -> None:
                 lower = file_path.lower()
                 if args.no_tabular_markdown and (lower.endswith(".csv") or lower.endswith(".tsv") or lower.endswith(".parquet")):
                     continue
-                for row_idx, text in enumerate(iter_text_from_file(file_path)):
-                    text_norm = normalize_text(text)
-                    if not text_norm:
-                        continue
-                    if not passes_quality(text_norm, filter_spec):
-                        continue
-                    doc = {
-                        "text": text_norm,
-                        "source": f"kaggle:{repo_id}",
-                        "url": f"https://www.kaggle.com/datasets/{repo_id}",
-                        "language": "ne",
-                        "doc_id": make_doc_id(repo_id, file_path, row_idx),
-                    }
-                    h = hash_text(text_norm)
-                    pending.append((h, doc))
+                try:
+                    for row_idx, text in enumerate(iter_text_from_file(file_path)):
+                        text_norm = normalize_text(text)
+                        if not text_norm:
+                            continue
+                        if not passes_quality(text_norm, filter_spec):
+                            continue
+                        doc = {
+                            "text": text_norm,
+                            "source": f"kaggle:{repo_id}",
+                            "url": f"https://www.kaggle.com/datasets/{repo_id}",
+                            "language": "ne",
+                            "doc_id": make_doc_id(repo_id, file_path, row_idx),
+                        }
+                        h = hash_text(text_norm)
+                        pending.append((h, doc))
 
-                    if len(pending) >= 1000:
-                        new_items = store.filter_new(pending)
-                        pending = []
-                        for h_new, row_new in new_items:
-                            out_rows.append(row_new)
-                            out_hashes.append(h_new)
-                            total_rows += 1
+                        if len(pending) >= 1000:
+                            new_items = store.filter_new(pending)
+                            pending = []
+                            for h_new, row_new in new_items:
+                                out_rows.append(row_new)
+                                out_hashes.append(h_new)
+                                total_rows += 1
+                                if args.max_rows and total_rows >= args.max_rows:
+                                    break
                             if args.max_rows and total_rows >= args.max_rows:
                                 break
+
+                        if len(out_rows) >= args.batch_size:
+                            upload_parquet_batch(
+                                api=hf_api,
+                                repo_id=args.target_repo,
+                                token=token,
+                                rows=out_rows,
+                                shard_index=shard_index,
+                            )
+                            store.insert_hashes(out_hashes)
+                            out_rows = []
+                            out_hashes = []
+                            shard_index += 1
+                            uploaded += 1
+
                         if args.max_rows and total_rows >= args.max_rows:
                             break
-
-                    if len(out_rows) >= args.batch_size:
-                        upload_parquet_batch(
-                            api=hf_api,
-                            repo_id=args.target_repo,
-                            token=token,
-                            rows=out_rows,
-                            shard_index=shard_index,
-                        )
-                        store.insert_hashes(out_hashes)
-                        out_rows = []
-                        out_hashes = []
-                        shard_index += 1
-                        uploaded += 1
-
-                    if args.max_rows and total_rows >= args.max_rows:
-                        break
+                except Exception as exc:
+                    logger.warning("Skipping file due to error %s: %s", file_path, exc)
+                    continue
                 if args.max_rows and total_rows >= args.max_rows:
                     break
 
             if not args.keep_files:
                 shutil.rmtree(dataset_dir, ignore_errors=True)
+
+            append_checkpoint(args.checkpoint, repo_id)
+            done.add(repo_id)
 
             if args.max_rows and total_rows >= args.max_rows:
                 break
