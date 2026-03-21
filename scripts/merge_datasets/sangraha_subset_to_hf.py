@@ -40,13 +40,47 @@ def parse_list(raw: str) -> List[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def resolve_parquet_files(
+    api: HfApi, repo_id: str, subset: str, split: str
+) -> List[str]:
+    prefix = f"{subset}/{split}/"
+    try:
+        files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+    except Exception as exc:
+        logger.warning("Failed to list repo files for %s: %s", repo_id, exc)
+        return []
+    parquet_files = [
+        f for f in files if f.startswith(prefix) and f.endswith(".parquet")
+    ]
+    parquet_files.sort()
+    return [f"hf://datasets/{repo_id}/{path}" for path in parquet_files]
+
+
 def iter_sangraha_rows(
-    repo_id: str, subset: str, split: str, download_first: bool
+    repo_id: str,
+    subset: str,
+    split: str,
+    download_first: bool,
+    api: HfApi,
 ) -> Iterator[Dict[str, Any]]:
-    if download_first:
-        ds = load_dataset(repo_id, name=subset, split=split, streaming=False)
+    data_files = resolve_parquet_files(api, repo_id, subset, split)
+    if data_files:
+        logger.info("Using %s parquet files for %s/%s", len(data_files), subset, split)
+        ds = load_dataset(
+            "parquet",
+            data_files=data_files,
+            split="train",
+            streaming=not download_first,
+        )
     else:
-        ds = load_dataset(repo_id, name=subset, split=split, streaming=True)
+        logger.warning(
+            "No parquet files found for %s/%s; falling back to dataset builder",
+            subset,
+            split,
+        )
+        ds = load_dataset(
+            repo_id, name=subset, split=split, streaming=not download_first
+        )
     for row in ds:
         yield row
 
@@ -126,7 +160,7 @@ def main() -> None:
         login()
         token = get_token()
 
-    api = HfApi()
+    api = HfApi(token=token)
     try:
         api.repo_info(args.target_repo, repo_type="dataset", token=token)
     except Exception:
@@ -168,7 +202,9 @@ def main() -> None:
         batches_written = 0
 
         for row_idx, row in enumerate(
-            iter_sangraha_rows(args.source_repo, subset, split, args.download_first)
+            iter_sangraha_rows(
+                args.source_repo, subset, split, args.download_first, api
+            )
         ):
             text_raw = row.get("text")
             if not isinstance(text_raw, str):
