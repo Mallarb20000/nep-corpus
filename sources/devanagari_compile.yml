@@ -1,0 +1,71 @@
+datasets:
+  - name: hplt_deva
+    repo: HPLT/HPLT2.0_cleaned
+    kind: hplt
+    enabled: true
+    configs:
+      - npi_Deva
+      - hin_Deva
+      - mar_Deva
+      - mai_Deva
+      - san_Deva
+      - bho_Deva
+      - awa_Deva
+      - mag_Deva
+      - hne_Deva
+      - kas_Deva
+    splits:
+      - train
+
+  - name: c4_deva
+    repo: allenai/c4
+    kind: c4
+    enabled: true
+    configs:
+      - hi
+      - ne
+      - mr
+    splits:
+      - train
+
+#  - name: wikipedia_nepali_deva
+#    repo: wikimedia/wikipedia
+#    kind: wikipedia
+#    enabled: false
+#    configs:
+#      - 20231101.ne
+#      - 20231101.new
+#      - 20231101.mai
+#      - 20231101.bh
+#      - 20231101.dty
+#      - 20231101.sa
+#      - 20231101.hi
+#      - 20231101.mr
+#      - 20231101.gom
+#      - 20231101.bho
+#      - 20231101.pi
+#      - 20231101.awa
+#      - 20231101.anp
+#    splits:
+#      - train
+#
+#  - name: sangraha_nepali
+#    repo: ai4bharat/sangraha
+#    kind: sangraha
+#    enabled: false
+#    configs:
+#      - verified/nep
+#      - unverified/nep
+#      - synthetic/npi_Deva
+#      - verified/hin
+#      - unverified/hin
+#      - synthetic/hin_Deva
+#      - verified/san
+#      - unverified/san
+#      - synthetic/san_Deva
+#      - verified/mai
+#      - verified/doi
+#      - verified/gom
+#      - synthetic/mar_Deva
+#    splits:
+#      - train
