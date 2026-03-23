@@ -137,12 +137,14 @@ def _iter_work_plan_from_config(
     *,
     only: Optional[set[str]],
     exclude: Optional[set[str]],
-) -> List[Tuple[str, str, str, str, Dict[str, Any]]]:
+) -> List[Tuple[str, str, str, str, Dict[str, Any], Dict[str, Any], Optional[str]]]:
     datasets = cfg.get("datasets", [])
     if not isinstance(datasets, list):
         raise ValueError("Config 'datasets' must be a list")
 
-    work_plan: List[Tuple[str, str, str, str, Dict[str, Any]]] = []
+    work_plan: List[
+        Tuple[str, str, str, str, Dict[str, Any], Dict[str, Any], Optional[str]]
+    ] = []
     for entry in datasets:
         if not isinstance(entry, dict):
             continue
@@ -164,26 +166,36 @@ def _iter_work_plan_from_config(
         splits = entry.get("splits") or ["train"]
         kind = entry.get("kind") or "generic"
         filters = entry.get("filters") or {}
+        fields = entry.get("fields") or {}
+        language_override = entry.get("language_override")
         if not isinstance(filters, dict):
             filters = {}
+        if not isinstance(fields, dict):
+            fields = {}
 
         for config in configs:
             for split in splits:
-                work_plan.append((repo_id, config, split, kind, filters))
+                work_plan.append(
+                    (repo_id, config, split, kind, filters, fields, language_override)
+                )
 
     return work_plan
 
 
 def _iter_work_plan_from_args(
     args: argparse.Namespace,
-) -> List[Tuple[str, str, str, str, Dict[str, Any]]]:
-    work_plan: List[Tuple[str, str, str, str, Dict[str, Any]]] = []
+) -> List[
+    Tuple[str, str, str, str, Dict[str, Any], Dict[str, Any], Optional[str]]
+]:
+    work_plan: List[
+        Tuple[str, str, str, str, Dict[str, Any], Dict[str, Any], Optional[str]]
+    ] = []
     for cfg in parse_list(args.hplt_configs):
         for split in parse_list(args.hplt_splits):
-            work_plan.append((args.hplt_repo, cfg, split, "hplt", {}))
+            work_plan.append((args.hplt_repo, cfg, split, "hplt", {}, {}, None))
     for cfg in parse_list(args.c4_configs):
         for split in parse_list(args.c4_splits):
-            work_plan.append((args.c4_repo, cfg, split, "c4", {}))
+            work_plan.append((args.c4_repo, cfg, split, "c4", {}, {}, None))
     return work_plan
 
 
@@ -284,7 +296,9 @@ def main() -> None:
     exclude = set(parse_list(args.exclude)) if args.exclude else None
 
     config_path = Path(args.config) if args.config else None
-    work_plan: List[Tuple[str, str, str, str, Dict[str, Any]]]
+    work_plan: List[
+        Tuple[str, str, str, str, Dict[str, Any], Dict[str, Any], Optional[str]]
+    ]
     if config_path and config_path.exists():
         cfg = load_config(config_path)
         work_plan = _iter_work_plan_from_config(cfg, only=only, exclude=exclude)
@@ -294,7 +308,7 @@ def main() -> None:
     else:
         work_plan = _iter_work_plan_from_args(args)
 
-    for repo_id, config, split, kind, filters in work_plan:
+    for repo_id, config, split, kind, filters, fields, language_override in work_plan:
         source_key = make_source_key(repo_id, config, split)
         if source_key in done:
             logger.info("Skipping completed: %s", source_key)
@@ -307,7 +321,12 @@ def main() -> None:
         for row_idx, row in enumerate(
             iter_dataset_rows(repo_id, config, split, args.download_first)
         ):
-            text_raw = row.get("text")
+            text_field = fields.get("text") or "text"
+            url_field = fields.get("url") or "url"
+            doc_id_field = fields.get("doc_id") or "doc_id"
+            lang_field = fields.get("language") or "lang"
+
+            text_raw = row.get(text_field)
             if not isinstance(text_raw, str):
                 continue
             text_norm = normalize_text(text_raw)
@@ -324,34 +343,53 @@ def main() -> None:
                 if source_exclude and row_source in source_exclude:
                     continue
 
+                lang_equals = filters.get("lang_equals")
+                if lang_equals and isinstance(lang_equals, dict):
+                    field = lang_equals.get("field")
+                    value = lang_equals.get("value")
+                    if field and value is not None:
+                        if row.get(field) != value:
+                            continue
+
             if kind == "hplt" or repo_id == args.hplt_repo:
-                lang = row.get("lang") or config
-                url = row.get("u") or row.get("url")
+                lang = row.get(lang_field) or config
+                url = row.get("u") or row.get(url_field)
                 doc_id = (
                     row.get("id")
-                    or row.get("doc_id")
+                    or row.get(doc_id_field)
                     or row.get("u")
                     or f"{source_key}:{row_idx}"
                 )
             elif kind == "c4" or repo_id == args.c4_repo:
                 lang = config
-                url = row.get("url")
+                url = row.get(url_field)
                 doc_id = (
                     row.get("id")
-                    or row.get("doc_id")
-                    or row.get("url")
+                    or row.get(doc_id_field)
+                    or row.get(url_field)
+                    or f"{source_key}:{row_idx}"
+                )
+            elif kind == "sangraha":
+                lang = split
+                url = row.get(url_field)
+                doc_id = (
+                    row.get(doc_id_field)
+                    or row.get("id")
                     or f"{source_key}:{row_idx}"
                 )
             else:
-                lang = row.get("lang") or config
-                url = row.get("url") or row.get("u")
+                lang = row.get(lang_field) or config
+                url = row.get(url_field) or row.get("u")
                 doc_id = (
                     row.get("id")
-                    or row.get("doc_id")
-                    or row.get("url")
+                    or row.get(doc_id_field)
+                    or row.get(url_field)
                     or row.get("u")
                     or f"{source_key}:{row_idx}"
                 )
+
+            if language_override:
+                lang = language_override
 
             batch.append(
                 {

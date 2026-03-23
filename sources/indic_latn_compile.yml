@@ -1,0 +1,59 @@
+datasets:
+  - name: c4_hi_latn
+    repo: allenai/c4
+    kind: c4
+    enabled: true
+    configs:
+      - hi-Latn
+    splits:
+      - train
+
+  - name: sangraha_latn
+    repo: ai4bharat/sangraha
+    kind: sangraha
+    enabled: true
+    configs:
+      - synthetic
+    splits:
+      - asm_Latn
+      - ben_Latn
+      - guj_Latn
+      - hin_Latn
+      - kan_Latn
+      - mal_Latn
+      - mar_Latn
+      - npi_Latn
+      - ory_Latn
+      - pan_Latn
+      - san_Latn
+      - tam_Latn
+      - tel_Latn
+      - urd_Latn
+
+#  - name: romanized_hindi
+#    repo: sk-community/romanized_hindi
+#    kind: generic
+#    enabled: false
+#    configs:
+#      - default
+#    splits:
+#      - train
+#    fields:
+#      text: hi_rom
+#    language_override: hi-Latn
+#
+#  - name: google_dakshina_hi
+#    repo: suhani-sarvam/google-dakshina
+#    kind: generic
+#    enabled: false
+#    configs:
+#      - default
+#    splits:
+#      - train
+#    fields:
+#      text: roman
+#      language: lang_code
+#    filters:
+#      lang_equals:
+#        field: lang_code
+#        value: hi
