@@ -195,7 +195,13 @@ def _get_sanitized_features(plan: SourcePlan) -> Optional[Features]:
             info = next(iter(infos.values())) if infos else None
         if not info or not getattr(info, "features", None):
             return None
-        return _sanitize_feature(info.features)
+        sanitized = _sanitize_feature(info.features)
+        if isinstance(sanitized, Features):
+            return sanitized
+        if isinstance(sanitized, dict):
+            return Features(sanitized)
+        # If sanitized is a bare Value/Sequence/etc, ignore to avoid HF schema errors.
+        return None
     except Exception as exc:
         logger.warning("Failed to fetch/sanitize features for %s: %s", plan.source_key, exc)
         return None
@@ -224,10 +230,25 @@ def iter_rows(plan: SourcePlan) -> Iterator[Dict[str, Any]]:
     load_kwargs = {"split": plan.split, "streaming": True}
     if features is not None:
         load_kwargs["features"] = features
-    if plan.config:
-        ds = load_dataset(plan.source_id, name=plan.config, **load_kwargs)
-    else:
-        ds = load_dataset(plan.source_id, **load_kwargs)
+    try:
+        if plan.config:
+            ds = load_dataset(plan.source_id, name=plan.config, **load_kwargs)
+        else:
+            ds = load_dataset(plan.source_id, **load_kwargs)
+    except TypeError as exc:
+        if features is not None:
+            logger.warning(
+                "Feature override failed for %s (%s). Retrying without features.",
+                plan.source_key,
+                exc,
+            )
+            load_kwargs.pop("features", None)
+            if plan.config:
+                ds = load_dataset(plan.source_id, name=plan.config, **load_kwargs)
+            else:
+                ds = load_dataset(plan.source_id, **load_kwargs)
+        else:
+            raise
     if plan.shuffle_buffer and plan.shuffle_buffer > 0:
         try:
             ds = ds.shuffle(buffer_size=plan.shuffle_buffer, seed=42)
